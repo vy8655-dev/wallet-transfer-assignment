@@ -37,6 +37,15 @@ func generateID() string {
 
 // Transfer implements a transactional, idempotent wallet transfer.
 func (s *Service) Transfer(ctx context.Context, req TransferRequest) (TransferResult, error) {
+	if req.Amount <= 0 {
+		return TransferResult{}, errors.New("amount must be > 0")
+	}
+	if req.FromWalletID == "" || req.ToWalletID == "" {
+		return TransferResult{}, errors.New("fromWalletId and toWalletId are required")
+	}
+	if req.FromWalletID == req.ToWalletID {
+		return TransferResult{}, errors.New("fromWalletId and toWalletId must be different")
+	}
 	// optimistic claim via idempotency record
 	// try to insert idempotency record; if exists and completed return existing transfer
 	// if exists and in-progress, poll for completion
