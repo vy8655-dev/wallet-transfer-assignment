@@ -41,7 +41,7 @@ func (h *httpHandler) createTransfer(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "insufficient funds", http.StatusUnprocessableEntity)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 

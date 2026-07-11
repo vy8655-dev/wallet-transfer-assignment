@@ -96,6 +96,67 @@ func TestTransfer_InsufficientFunds_Service(t *testing.T) {
 	}
 }
 
+func TestTransfer_RollsBackAfterLedgerFailure(t *testing.T) {
+	repo, svc, cleanup := setupInMemory(t)
+	defer cleanup()
+
+	if err := repo.CreateWallet("rb_src", 100); err != nil {
+		t.Fatalf("create source wallet: %v", err)
+	}
+	if err := repo.CreateWallet("rb_dst", 0); err != nil {
+		t.Fatalf("create destination wallet: %v", err)
+	}
+
+	// Force a ledger insert failure during the transaction so the service must roll back the debit.
+	_, err := repo.db.Exec(`CREATE TRIGGER fail_ledger_insert AFTER INSERT ON ledger_entries BEGIN SELECT RAISE(ABORT, 'forced ledger failure'); END;`)
+	if err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err = svc.Transfer(context.TODO(), TransferRequest{IdempotencyKey: "rb-key", FromWalletID: "rb_src", ToWalletID: "rb_dst", Amount: 50})
+	if err == nil {
+		t.Fatal("expected transfer to fail")
+	}
+
+	if bal, _ := repo.GetWalletBalance("rb_src"); bal != 100 {
+		t.Fatalf("expected source balance to remain unchanged, got %d", bal)
+	}
+	if bal, _ := repo.GetWalletBalance("rb_dst"); bal != 0 {
+		t.Fatalf("expected destination balance to remain unchanged, got %d", bal)
+	}
+}
+
+func TestTransfer_DebitDatabaseErrorIsNotMaskedAsInsufficientFunds(t *testing.T) {
+	repo, svc, cleanup := setupInMemory(t)
+	defer cleanup()
+
+	if err := repo.CreateWallet("db_src", 100); err != nil {
+		t.Fatalf("create source wallet: %v", err)
+	}
+	if err := repo.CreateWallet("db_dst", 0); err != nil {
+		t.Fatalf("create destination wallet: %v", err)
+	}
+
+	_, err := repo.db.Exec(`CREATE TRIGGER fail_debit_update BEFORE UPDATE ON wallets BEGIN SELECT RAISE(ABORT, 'forced debit failure'); END;`)
+	if err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err = svc.Transfer(context.TODO(), TransferRequest{IdempotencyKey: "db-key", FromWalletID: "db_src", ToWalletID: "db_dst", Amount: 50})
+	if err == nil {
+		t.Fatal("expected transfer to fail")
+	}
+	if err == ErrInsufficientFunds {
+		t.Fatalf("expected a database error, got insufficient funds")
+	}
+	if bal, _ := repo.GetWalletBalance("db_src"); bal != 100 {
+		t.Fatalf("expected source balance to remain unchanged, got %d", bal)
+	}
+	if bal, _ := repo.GetWalletBalance("db_dst"); bal != 0 {
+		t.Fatalf("expected destination balance to remain unchanged, got %d", bal)
+	}
+}
+
 func TestStartHTTPServer_CreatesServer(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {

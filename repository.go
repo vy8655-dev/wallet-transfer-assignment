@@ -46,8 +46,18 @@ func (r *Repository) DebitIfEnough(ctx context.Context, tx *sql.Tx, walletID str
 }
 
 func (r *Repository) Credit(ctx context.Context, tx *sql.Tx, walletID string, amount int64) error {
-	_, err := tx.ExecContext(ctx, `UPDATE wallets SET balance = balance + ? WHERE id = ?`, amount, walletID)
-	return err
+	res, err := tx.ExecContext(ctx, `UPDATE wallets SET balance = balance + ? WHERE id = ?`, amount, walletID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *Repository) InsertTransfer(ctx context.Context, tx *sql.Tx, t Transfer) error {

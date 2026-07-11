@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/rand"
 	"time"
 )
 
@@ -15,8 +16,15 @@ type Service struct {
 
 func NewService(repo *Repository) *Service { return &Service{repo: repo} }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := crand.Read(b); err != nil {
+		// Fall back to a deterministic byte pattern only if entropy is unavailable.
+		for i := range b {
+			b[i] = byte(i + 1)
+		}
+	}
+	return hex.EncodeToString(b)
 }
 
 type TransferRequest struct {
@@ -32,7 +40,7 @@ type TransferResult struct {
 }
 
 func generateID() string {
-	return fmt.Sprintf("t_%d_%d", time.Now().UnixNano(), rand.Intn(100000))
+	return fmt.Sprintf("t_%d_%s", time.Now().UnixNano(), randomHex(8))
 }
 
 // Transfer implements a transactional, idempotent wallet transfer.
@@ -101,7 +109,14 @@ func (s *Service) Transfer(ctx context.Context, req TransferRequest) (TransferRe
 					tid, status, resp, err := s.repo.GetIdempotency(pollCtx, req.IdempotencyKey)
 					if err == nil {
 						if status == "COMPLETED" {
-							return TransferResult{TransferID: tid, State: "PROCESSED"}, nil
+							if tid == "" {
+								return TransferResult{}, errors.New("idempotency record completed but missing transfer id")
+							}
+							state := "PROCESSED"
+							if resp != "" {
+								state = resp
+							}
+							return TransferResult{TransferID: tid, State: state}, nil
 						}
 						if status == "FAILED" {
 							if resp == "insufficient_funds" {
@@ -123,24 +138,23 @@ func (s *Service) Transfer(ctx context.Context, req TransferRequest) (TransferRe
 
 	// try to debit
 	if err := s.repo.DebitIfEnough(ctx, tx, req.FromWalletID, req.Amount); err != nil {
-		// Debit failed: mark transfer FAILED and finalize the idempotency record
-		// with a terminal FAILED status and a stored response so retries
-		// return the same terminal outcome instead of polling indefinitely.
-		if uerr := s.repo.UpdateTransferState(ctx, tx, transferID, "FAILED"); uerr != nil {
-			tx.Rollback()
-			return TransferResult{}, uerr
-		}
-		// finalize idempotency if present
-		if req.IdempotencyKey != "" {
-			if cerr := s.repo.CompleteIdempotency(ctx, tx, req.IdempotencyKey, transferID, "FAILED", "insufficient_funds"); cerr != nil {
+		if errors.Is(err, ErrInsufficientFunds) {
+			if uerr := s.repo.UpdateTransferState(ctx, tx, transferID, "FAILED"); uerr != nil {
 				tx.Rollback()
+				return TransferResult{}, uerr
+			}
+			if req.IdempotencyKey != "" {
+				if cerr := s.repo.CompleteIdempotency(ctx, tx, req.IdempotencyKey, transferID, "FAILED", "insufficient_funds"); cerr != nil {
+					tx.Rollback()
+					return TransferResult{}, cerr
+				}
+			}
+			if cerr := tx.Commit(); cerr != nil {
 				return TransferResult{}, cerr
 			}
+			return TransferResult{}, ErrInsufficientFunds
 		}
-		if cerr := tx.Commit(); cerr != nil {
-			return TransferResult{}, cerr
-		}
-		return TransferResult{}, ErrInsufficientFunds
+		return TransferResult{}, err
 	}
 
 	if err := s.repo.Credit(ctx, tx, req.ToWalletID, req.Amount); err != nil {
@@ -153,9 +167,6 @@ func (s *Service) Transfer(ctx context.Context, req TransferRequest) (TransferRe
 				tx.Rollback()
 				return TransferResult{}, cerr
 			}
-		}
-		if cerr := tx.Commit(); cerr != nil {
-			return TransferResult{}, cerr
 		}
 		return TransferResult{}, err
 	}
@@ -174,9 +185,6 @@ func (s *Service) Transfer(ctx context.Context, req TransferRequest) (TransferRe
 				return TransferResult{}, cerr
 			}
 		}
-		if cerr := tx.Commit(); cerr != nil {
-			return TransferResult{}, cerr
-		}
 		return TransferResult{}, err
 	}
 	if err := s.repo.InsertLedgerEntry(ctx, tx, credit); err != nil {
@@ -189,9 +197,6 @@ func (s *Service) Transfer(ctx context.Context, req TransferRequest) (TransferRe
 				tx.Rollback()
 				return TransferResult{}, cerr
 			}
-		}
-		if cerr := tx.Commit(); cerr != nil {
-			return TransferResult{}, cerr
 		}
 		return TransferResult{}, err
 	}
